@@ -21,6 +21,7 @@
 #include <limits>
 #include <fstream>
 #include <string>
+#include <sstream>
 #include <algorithm>
 
 using std::placeholders::_1;
@@ -31,7 +32,6 @@ class HumanTrackerNode : public rclcpp::Node
 public:
   enum class State {
     WAIT_FOR_MAP_AND_POSE = 0,
-    GOING_TO_ORIGIN,
     GOING_TO_FIRST_HUMAN,
     CHECKING_FIRST_HUMAN,
     GOING_TO_SECOND_HUMAN,
@@ -42,10 +42,29 @@ public:
     DONE
   };
 
+  static constexpr const char* STATE_NAMES[] = {
+      "Waiting for Map and Pose",
+      "Going to 1st Human",
+      "Checking 1st Human",
+      "Going to 2nd Human",
+      "Checking 2nd Human",
+      "Waiting for Costmap",
+      "Search Going to Waypoint",
+      "Search Spinning at Waypoint",
+      "Done"
+  };
+
+  // current state of tracking a human
+  enum HumanTrackingState {
+      UNKNOWN,
+      STILL,
+      MOVED
+  };
+
   struct HumanOriginal {
     double x;
     double y;
-    bool moved;
+    HumanTrackingState state;
   };
 
   struct ExtraPoint {
@@ -81,8 +100,7 @@ public:
       have_map_(false),
       have_costmap_(false)
   {
-    // --- Subscriptions ---
-
+    // Creating subscriptions
     auto qos_map = rclcpp::QoS(1).reliable().transient_local();
     map_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
         "/map",
@@ -110,21 +128,22 @@ public:
 
     // Original human positions in map frame
     humans_.clear();
-    humans_.push_back({  1.0,  -1.0, false });   // Human 0
-    humans_.push_back({ -12.0,  15.0, false });  // Human 1
+    humans_.push_back({  1.0,  -1.0, HumanTrackingState::UNKNOWN });   // Human 0
+    humans_.push_back({ -12.0,  15.0, HumanTrackingState::UNKNOWN });  // Human 1
 
     initSearchWaypoints();
 
     // CSV in current working directory
-    debug_log_.open("human_tracker_debug.csv");
+    const char* debug_filename = "human_tracker_debug.csv";
+    debug_log_.open(debug_filename);
     if (debug_log_.is_open()) {
       debug_log_ << "time,label,state,wp_or_human_idx,goal_x,goal_y,"
                     "amcl_x,amcl_y,amcl_yaw\n";
       RCLCPP_INFO(get_logger(),
-                  "Debug log file opened at 'human_tracker_debug.csv'.");
+                  "Debug log file opened at '%s'", debug_filename);
     } else {
       RCLCPP_WARN(get_logger(),
-                  "Failed to open debug log file at 'human_tracker_debug.csv'.");
+                  "Failed to open debug log file at '%s'", debug_filename);
     }
 
     RCLCPP_INFO(get_logger(), "HumanTrackerNode started.");
@@ -132,12 +151,10 @@ public:
 
 private:
   // ---------- Utils & logging ----------
-
   std::string stateToString(State s) const
   {
     switch (s) {
       case State::WAIT_FOR_MAP_AND_POSE:      return "WAIT_FOR_MAP_AND_POSE";
-      case State::GOING_TO_ORIGIN:            return "GOING_TO_ORIGIN";
       case State::GOING_TO_FIRST_HUMAN:       return "GOING_TO_FIRST_HUMAN";
       case State::CHECKING_FIRST_HUMAN:       return "CHECKING_FIRST_HUMAN";
       case State::GOING_TO_SECOND_HUMAN:      return "GOING_TO_SECOND_HUMAN";
@@ -183,8 +200,7 @@ private:
       << ayaw << "\n";
   }
 
-  // ---------- Callbacks ----------
-
+  // Callbacks
   void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
   {
     map_ = msg;
@@ -302,14 +318,42 @@ private:
 
     if (!started_navigation_ && map_ && state_ == State::WAIT_FOR_MAP_AND_POSE) {
       RCLCPP_INFO(get_logger(), "Map and pose ready. Going to map origin.");
-      goToOrigin();
       started_navigation_ = true;
-      state_ = State::GOING_TO_ORIGIN;
+
+      // sort humans by distance
+      if (last_amcl_pose_) {
+          const auto& p = last_amcl_pose_->pose.pose;
+          double rx = p.position.x;
+          double ry = p.position.y;
+          double d0 = std::hypot(humans_[0].x - rx, humans_[0].y - ry);
+          double d1 = std::hypot(humans_[1].x - rx, humans_[1].y - ry);
+          if (d0 <= d1) {
+              first_human_idx_ = 0;
+              second_human_idx_ = 1;
+          }
+          else {
+              first_human_idx_ = 1;
+              second_human_idx_ = 0;
+          }
+      }
+      else {
+          first_human_idx_ = 0;
+          second_human_idx_ = 1;
+      }
+
+      RCLCPP_INFO(
+          get_logger(),
+          "Phase 1 ordering: first human=%d at (%.2f, %.2f), second human=%d at (%.2f, %.2f)",
+          first_human_idx_, humans_[first_human_idx_].x, humans_[first_human_idx_].y,
+          second_human_idx_, humans_[second_human_idx_].x, humans_[second_human_idx_].y);
+
+      goToHumanVantage(first_human_idx_);
+
+      state_ = State::GOING_TO_FIRST_HUMAN;
     }
   }
 
   // ---------- Navigation helpers ----------
-
   void goToOrigin()
   {
     auto goal = std::make_shared<geometry_msgs::msg::Pose>();
@@ -323,10 +367,10 @@ private:
     goal->orientation = tf2::toMsg(q);
 
     if (!navigator_->GoToPose(goal)) {
-      RCLCPP_ERROR(get_logger(), "GoToPose request to origin was NOT accepted.");
+      RCLCPP_ERROR(get_logger(), "Go to pose command was NOT accepted by navigator.");
       state_ = State::DONE;
     } else {
-      RCLCPP_INFO(get_logger(), "GoToPose to origin sent!");
+      RCLCPP_INFO(get_logger(), "Go to origin command sent!");
       logEvent("PHASE1_GOAL_SENT", 0, goal.get());
     }
   }
@@ -338,7 +382,7 @@ private:
       state_ = State::DONE;
       return;
     }
-    const auto &h = humans_[idx];
+    const auto& h = humans_[idx];
 
     auto goal = std::make_shared<geometry_msgs::msg::Pose>();
 
@@ -382,26 +426,28 @@ private:
       return p;
     };
 
-    // 17 waypoints
-    search_waypoints_.push_back(makePose(-13.0,  15.0)); // W1
-    search_waypoints_.push_back(makePose(-13.0,  22.0)); // W2  (top left corner)
-    search_waypoints_.push_back(makePose( -7.0,  20.0)); // W3  (between small shelves)
-    search_waypoints_.push_back(makePose(  3.0,  22.0)); // W4  (big corridor)
-    search_waypoints_.push_back(makePose( 12.0,  17.0)); // W5  (below top right corner)
-    search_waypoints_.push_back(makePose( -9.0,  11.0)); // W6  (between pillars, right of Human2)
-    search_waypoints_.push_back(makePose(-12.0,   2.0)); // W7  (center left)
-    search_waypoints_.push_back(makePose(-12.0, -13.0)); // W8  (bottom left)
-    search_waypoints_.push_back(makePose( -4.0, -18.0)); // W9  (lower corridor, near bottom left)
-    search_waypoints_.push_back(makePose( -5.0,  -3.0)); // W10 (higher corridor, near bottom left)
-    search_waypoints_.push_back(makePose(  2.0,  -4.0)); // W11 (right above spawning point)
-    search_waypoints_.push_back(makePose(  9.0, -24.0)); // W12 (bottom right corner)
-    search_waypoints_.push_back(makePose( 10.0, -18.0)); // W13 (above bottom right, between shelves)
-    search_waypoints_.push_back(makePose( 11.0, -10.0)); // W14 (center of right corridor)
-    search_waypoints_.push_back(makePose( 11.0,   0.0)); // W15 (top of right corridor)
-    search_waypoints_.push_back(makePose(  4.0,   4.0)); // W16 (center of warehouse)
-    search_waypoints_.push_back(makePose( 14.0,   8.0)); // W17 (center-right, between shelves)
+    // read waypoints
+    std::string text;
+    std::ifstream file("src/nav/src/waypoints.txt");
+    while (std::getline(file, text))
+    {
+        unsigned int axes = 0;
+        std::string coord_str[2];
+
+        std::stringstream ss(text);
+        while (ss >> coord_str[axes] && axes < 2)
+        {
+            axes++;
+        }
+        if (axes > 0)
+        {
+            search_waypoints_.push_back(makePose(std::stof(coord_str[0]), std::stof(coord_str[1])));
+        }
+    }
+    RCLCPP_INFO(get_logger(), "here");
   }
 
+  // sends the robot to a waypoint index
   void sendSearchWaypointGoal(int idx)
   {
     if (idx < 0 || static_cast<std::size_t>(idx) >= search_waypoints_.size()) {
@@ -427,8 +473,8 @@ private:
     }
   }
 
-  // ---------- Human sampling (single scan) ----------
-
+  // Checks if a human is in its original position with the laser scan.
+  // The robot must be within range for an accurate reading
   bool sampleHumanWindow(std::size_t idx)
   {
     if (!last_scan_ || !last_amcl_pose_) {
@@ -464,6 +510,7 @@ private:
     const double WINDOW_DEG        = 15.0;
     const double window_rad        = WINDOW_DEG * PI / 180.0;
 
+    // expected distance from human
     double dx = h.x - rx;
     double dy = h.y - ry;
     double expected_range = std::hypot(dx, dy);
@@ -476,14 +523,16 @@ private:
       return false;
     }
 
-    double angle_map   = std::atan2(dy, dx);
-    double angle_base  = angle_map - yaw;
-    double angle_sensor= angle_base + LASER_YAW_OFFSET;
+    // get local human angle
+    double angle_map    = std::atan2(dy, dx);
+    double angle_base   = angle_map - yaw;
+    double angle_sensor = angle_base + LASER_YAW_OFFSET;
 
     double angle_max = angle_min + angle_inc * (n - 1);
     while (angle_sensor < angle_min)  angle_sensor += TWO_PI;
     while (angle_sensor > angle_max)  angle_sensor -= TWO_PI;
 
+    // compute indices of laser scan window
     int center_idx = static_cast<int>(std::round((angle_sensor - angle_min) / angle_inc));
     if (center_idx < 0 || center_idx >= n) {
       RCLCPP_WARN(
@@ -506,7 +555,7 @@ private:
       if (!std::isfinite(r)) continue;
 
       double diff = std::fabs(r - expected_range);
-      if (diff < best_measured || !std::isfinite(best_measured)) {
+      if (diff < best_measured) {
         best_measured = r;
         best_idx = i;
       }
@@ -711,8 +760,7 @@ private:
     }
   }
 
-  // ---------- Phase 2: clustering accumulated extra points ----------
-
+  // Checks if moved humans were found
   void clusterExtraPointsAndLog()
   {
     if (extra_points_.empty()) {
@@ -722,8 +770,7 @@ private:
       return;
     }
 
-    // --- 1. Simple radius-based clustering in 2D ---
-
+    // radius-based clustering
     struct Cluster {
       double sum_x{0.0};
       double sum_y{0.0};
@@ -774,8 +821,7 @@ private:
       return;
     }
 
-    // --- 2. Compute centroids + filter small clusters ---
-
+    // Compute centroids & filter small clusters
     struct ClusterInfo {
       double cx;
       double cy;
@@ -838,7 +884,7 @@ private:
 
       for (std::size_t hi = 0; hi < humans_.size(); ++hi) {
         const auto &h = humans_[hi];
-        if (!h.moved) {
+        if (h.state != HumanTrackingState::MOVED) {
           continue;
         }
 
@@ -882,7 +928,7 @@ private:
       const int hi = cand.human_idx;
       const int ci = cand.cluster_idx;
 
-      if (!humans_[hi].moved) {
+      if (humans_[hi].state != HumanTrackingState::MOVED) {
         continue;
       }
       if (cluster_used[ci]) {
@@ -899,7 +945,7 @@ private:
 
     for (std::size_t hi = 0; hi < humans_.size(); ++hi) {
       const auto &h = humans_[hi];
-      if (!h.moved) {
+      if (h.state != HumanTrackingState::MOVED) {
         continue;
       }
 
@@ -925,53 +971,18 @@ private:
     }
   }
 
-  // ---------- Main control loop ----------
-
+  // Main control loop
   void controlLoop()
   {
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 3000,
-      "ControlLoop state=%d, map_=%s, amcl=%s",
-      static_cast<int>(state_),
+      "ControlLoop state=%s, map_=%s, amcl=%s",
+      STATE_NAMES[static_cast<size_t>(state_)],
       map_ ? "yes" : "no",
       last_amcl_pose_ ? "yes" : "no");
 
     switch (state_) {
       case State::WAIT_FOR_MAP_AND_POSE:
-        break;
-
-      case State::GOING_TO_ORIGIN:
-        if (navigator_->IsTaskComplete()) {
-          RCLCPP_INFO(get_logger(), "Reached map origin.");
-          logEvent("PHASE1_GOAL_REACHED", 0);
-
-          if (last_amcl_pose_) {
-            const auto &p = last_amcl_pose_->pose.pose;
-            double rx = p.position.x;
-            double ry = p.position.y;
-            double d0 = std::hypot(humans_[0].x - rx, humans_[0].y - ry);
-            double d1 = std::hypot(humans_[1].x - rx, humans_[1].y - ry);
-            if (d0 <= d1) {
-              first_human_idx_  = 0;
-              second_human_idx_ = 1;
-            } else {
-              first_human_idx_  = 1;
-              second_human_idx_ = 0;
-            }
-          } else {
-            first_human_idx_  = 0;
-            second_human_idx_ = 1;
-          }
-
-          RCLCPP_INFO(
-            get_logger(),
-            "Phase 1 ordering: first human=%d at (%.2f, %.2f), second human=%d at (%.2f, %.2f)",
-            first_human_idx_,  humans_[first_human_idx_].x,  humans_[first_human_idx_].y,
-            second_human_idx_, humans_[second_human_idx_].x, humans_[second_human_idx_].y);
-
-          goToHumanVantage(first_human_idx_);
-          state_ = State::GOING_TO_FIRST_HUMAN;
-        }
         break;
 
       case State::GOING_TO_FIRST_HUMAN:
@@ -999,14 +1010,14 @@ private:
             }
           }
         } else {
-          bool still = (samples_hit_ > 0);
-          humans_[current_human_idx_].moved = !still;
+            // update human tracking state
+          humans_[current_human_idx_].state = samples_hit_ > 0 ? HumanTrackingState::STILL : HumanTrackingState::MOVED;
 
           RCLCPP_INFO(
             get_logger(),
             "Human %d check over %.2f s: total=%d, hits=%d -> %s",
             current_human_idx_, elapsed_sec, samples_total_, samples_hit_,
-            still ? "STILL" : "MOVED");
+              humans_[current_human_idx_].state == HumanTrackingState::STILL ? "STILL" : "MOVED");
 
           goToHumanVantage(second_human_idx_);
           state_ = State::GOING_TO_SECOND_HUMAN;
@@ -1039,8 +1050,9 @@ private:
             }
           }
         } else {
+            // update human tracking state
           bool still = (samples_hit_ > 0);
-          humans_[current_human_idx_].moved = !still;
+          humans_[current_human_idx_].state = samples_hit_ > 0? HumanTrackingState::STILL : HumanTrackingState::MOVED;
 
           RCLCPP_INFO(
             get_logger(),
@@ -1050,7 +1062,7 @@ private:
 
           for (std::size_t i = 0; i < humans_.size(); ++i) {
             auto &h = humans_[i];
-            if (h.moved) {
+            if (h.state == HumanTrackingState::MOVED) {
               RCLCPP_INFO(
                 get_logger(),
                 "SUMMARY: Human %zu MOVED from original position (%.2f, %.2f).",
@@ -1065,7 +1077,7 @@ private:
 
           bool any_moved = false;
           for (const auto &h : humans_) {
-            if (h.moved) { any_moved = true; break; }
+            if (h.state == HumanTrackingState::MOVED) { any_moved = true; break; }
           }
 
           if (!any_moved) {
