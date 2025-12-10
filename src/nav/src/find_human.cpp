@@ -413,7 +413,7 @@ private:
   void initSearchWaypoints()
   {
     search_waypoints_.clear();
-    search_waypoints_.reserve(17);
+    search_waypoints_.reserve(17); // we have 17 waypoints
 
     auto makePose = [](double x, double y) {
       geometry_msgs::msg::Pose p;
@@ -432,10 +432,10 @@ private:
     while (std::getline(file, text))
     {
         unsigned int axes = 0;
-        std::string coord_str[2];
+        std::string coord_str[20];
 
         std::stringstream ss(text);
-        while (ss >> coord_str[axes] && axes < 2)
+        while (ss >> coord_str[axes])
         {
             axes++;
         }
@@ -444,7 +444,6 @@ private:
             search_waypoints_.push_back(makePose(std::stof(coord_str[0]), std::stof(coord_str[1])));
         }
     }
-    RCLCPP_INFO(get_logger(), "here");
   }
 
   // sends the robot to a waypoint index
@@ -579,7 +578,6 @@ private:
   }
 
   // ---------- Costmap / extra-point helpers ----------
-
   bool isNearStaticMapObstacle(int mx, int my) const
   {
     if (!map_) return true;  // conservative
@@ -976,8 +974,8 @@ private:
   {
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 3000,
-      "ControlLoop state=%s, map_=%s, amcl=%s",
-      STATE_NAMES[static_cast<size_t>(state_)],
+      "ControlLoop state=%d, map_=%s, amcl=%s",
+      static_cast<int>(state_),
       map_ ? "yes" : "no",
       last_amcl_pose_ ? "yes" : "no");
 
