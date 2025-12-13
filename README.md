@@ -206,7 +206,7 @@ This is useful for offline analysis (e.g., plotting routes, checking timing, cor
 4. In the same terminal where you built 'navigation' go inside of Ros2-Robot-Navigation and build 'nav' package that contains `find_human.cpp`.
 5. Launch the node:
    ```bash
-   ros2 run nav human_tracker_node
+   ros2 run nav find_human_node
 6. Once it's running, amcl_pose will be waiting for an update in order to start receiving messages through that topic, do the following:
    - In RViz press '2D Estimate Pose'
    - Click where to robot is located.
