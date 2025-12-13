@@ -150,21 +150,9 @@ public:
   }
 
 private:
-  // ---------- Utils & logging ----------
-  std::string stateToString(State s) const
+  std::string getStateName(State s) const
   {
-    switch (s) {
-      case State::WAIT_FOR_MAP_AND_POSE:      return "WAIT_FOR_MAP_AND_POSE";
-      case State::GOING_TO_FIRST_HUMAN:       return "GOING_TO_FIRST_HUMAN";
-      case State::CHECKING_FIRST_HUMAN:       return "CHECKING_FIRST_HUMAN";
-      case State::GOING_TO_SECOND_HUMAN:      return "GOING_TO_SECOND_HUMAN";
-      case State::CHECKING_SECOND_HUMAN:      return "CHECKING_SECOND_HUMAN";
-      case State::WAIT_FOR_COSTMAP:           return "WAIT_FOR_COSTMAP";
-      case State::SEARCH_GOING_TO_WAYPOINT:   return "SEARCH_GOING_TO_WAYPOINT";
-      case State::SEARCH_SPINNING_AT_WAYPOINT:return "SEARCH_SPINNING_AT_WAYPOINT";
-      case State::DONE:                       return "DONE";
-      default:                                return "UNKNOWN";
-    }
+      return STATE_NAMES[static_cast<int>(s)];
   }
 
   void logEvent(const std::string &label,
@@ -191,7 +179,7 @@ private:
     debug_log_
       << t << ","
       << label << ","
-      << stateToString(state_) << ","
+      << getStateName(state_) << ","
       << wp_or_human_idx << ","
       << gx << ","
       << gy << ","
@@ -257,7 +245,7 @@ private:
     tf2::Transform tf;
     tf2::fromMsg(tf_laser_to_map.transform, tf);
 
-    // Optional: cap how many extra points we keep overall
+    // Cap how many extra points we keep overall
     constexpr std::size_t MAX_EXTRA_POINTS = 200000;
     if (extra_points_.size() > MAX_EXTRA_POINTS) {
       // Drop oldest half to prevent unbounded growth
@@ -273,7 +261,7 @@ private:
     const auto range_min   = msg->range_min;
     const auto range_max   = msg->range_max;
 
-    // Tuneable range window: ignore points too close or too far
+    // Ignore points too close or too far
     const double min_useful_range = std::max(0.7, static_cast<double>(range_min));
     const double max_useful_range = std::min(10.0, static_cast<double>(range_max));
 
@@ -316,6 +304,7 @@ private:
       msg->pose.pose.position.x,
       msg->pose.pose.position.y);
 
+    // Start searching if we received the first msg
     if (!started_navigation_ && map_ && state_ == State::WAIT_FOR_MAP_AND_POSE) {
       RCLCPP_INFO(get_logger(), "Map and pose ready. Going to map origin.");
       started_navigation_ = true;
@@ -353,7 +342,7 @@ private:
     }
   }
 
-  // ---------- Navigation helpers ----------
+  // Sends the robot to (0, 0)
   void goToOrigin()
   {
     auto goal = std::make_shared<geometry_msgs::msg::Pose>();
@@ -375,6 +364,7 @@ private:
     }
   }
 
+  // Sends the robot near a human for detection
   void goToHumanVantage(int idx)
   {
     if (idx < 0 || static_cast<std::size_t>(idx) >= humans_.size()) {
@@ -410,6 +400,7 @@ private:
     }
   }
 
+  // Loads waypoints from a file
   void initSearchWaypoints()
   {
     search_waypoints_.clear();
@@ -446,7 +437,7 @@ private:
     }
   }
 
-  // sends the robot to a waypoint index
+  // Sends the robot to a waypoint index
   void sendSearchWaypointGoal(int idx)
   {
     if (idx < 0 || static_cast<std::size_t>(idx) >= search_waypoints_.size()) {
@@ -577,7 +568,7 @@ private:
     return found_close;
   }
 
-  // ---------- Costmap / extra-point helpers ----------
+  // Checks if an obstacle is within 80cm of a point
   bool isNearStaticMapObstacle(int mx, int my) const
   {
     if (!map_) return true;  // conservative
@@ -974,8 +965,8 @@ private:
   {
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 3000,
-      "ControlLoop state=%d, map_=%s, amcl=%s",
-      static_cast<int>(state_),
+      "ControlLoop state=%s, map_=%s, amcl=%s",
+      getStateName(state_).c_str(),
       map_ ? "yes" : "no",
       last_amcl_pose_ ? "yes" : "no");
 
@@ -1170,8 +1161,6 @@ private:
         break;
     }
   }
-
-  // ---------- Members ----------
 
   std::shared_ptr<Navigator> navigator_;
 
